@@ -4,7 +4,7 @@
 
 ## 本机快速验证
 
-在此目录打开 PowerShell。需要 Node.js 和已启动的 Docker Desktop。默认使用本机已有的 ucm-cpu-validation:v2 镜像作为运行环境。模拟任务只用 /bin/sh，不下载镜像、不联网。
+在 PowerShell 中使用下方命令，或从其他目录通过 CLI 的绝对路径启动。需要 Node.js 和已启动的 Docker Desktop。默认使用本机已有的 ucm-cpu-validation:v2 镜像作为运行环境。模拟任务只用 /bin/sh，不下载镜像、不联网。
 
 ```powershell
 node cli.mjs run script success
@@ -30,7 +30,7 @@ node cli.mjs run script missing-report
 | adapters.mjs | 本地进程和 Docker 的执行方式。需要新的挂载或运行环境时在此扩展 |
 | cli.mjs | 两种编排入口、步骤记录和最终报告校验 |
 
-任务脚本接收步骤名和场景参数，通过 RUN_OUTPUT 取得结果目录。test 步骤写入 test-report.json，其中 checked、passed、failed 都是整数，checked 大于零且等于 passed 加 failed。Docker 各步骤使用独立容器，持久状态通过输出目录传递。真实编译如需保留 Linux 构建目录、权限或软链接，应配置持久卷或把制品导出到共享目录。
+任务脚本接收步骤名和场景参数，通过 RUN_OUTPUT 取得结果目录。test 步骤写入 test-report.json，其中 checked、passed、failed 都是整数，可选 skipped 必须为非负整数。checked 等于 passed、failed 和 skipped 之和，且至少有一项实际执行。Docker 各步骤使用独立容器，持久状态通过输出目录传递。真实编译如需保留 Linux 构建目录、权限或软链接，应配置持久卷或把制品导出到共享目录。
 
 ## dsh 编排
 
