@@ -1,0 +1,10 @@
+[
+  {
+    "id": "test",
+    "needs": [],
+    "after": [],
+    "reports": [
+      "test-report.json"
+    ]
+  }
+]
