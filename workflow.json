@@ -1,16 +1,28 @@
 [
   {
     "id": "build",
-    "needs": []
+    "needs": [],
+    "after": [],
+    "reports": []
   },
   {
     "id": "test",
     "needs": [
       "build"
+    ],
+    "after": [
+      "build"
+    ],
+    "reports": [
+      "test-report.json"
     ]
   },
   {
     "id": "archive",
-    "needs": []
+    "needs": [],
+    "after": [
+      "test"
+    ],
+    "reports": []
   }
 ]
