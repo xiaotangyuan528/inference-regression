@@ -1,0 +1,16 @@
+[
+  {
+    "id": "build",
+    "needs": []
+  },
+  {
+    "id": "test",
+    "needs": [
+      "build"
+    ]
+  },
+  {
+    "id": "archive",
+    "needs": []
+  }
+]
