@@ -1,11 +1,24 @@
 {
   "adapter": "docker",
-  "taskScript": "tasks/mock.sh",
   "image": "ucm-cpu-validation:v2",
+  "taskScript": "tasks/mock.sh",
+  "taskCwd": ".",
+  "workflow": "workflow.json",
+  "runsDir": "runs",
+  "resourceKey": "default",
   "timeoutMs": 30000,
+  "network": "none",
+  "mounts": [],
   "dsh": {
-    "command": "dsh",
-    "args": [],
-    "timeoutMs": 180000
+    "image": "",
+    "command": [
+      "dsh",
+      "--profile",
+      "headless"
+    ],
+    "envNames": [],
+    "timeoutMs": 180000,
+    "maxDecisions": 16,
+    "network": "bridge"
   }
 }
