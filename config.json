@@ -1,0 +1,11 @@
+{
+  "adapter": "docker",
+  "taskScript": "tasks/mock.sh",
+  "image": "ucm-cpu-validation:v2",
+  "timeoutMs": 30000,
+  "dsh": {
+    "command": "dsh",
+    "args": [],
+    "timeoutMs": 180000
+  }
+}
