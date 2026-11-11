@@ -1,172 +1,168 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, resolve, join } from 'node:path';
+
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { execute, cleanup, runLogged, logTail } from './adapters.mjs';
+import { loadConfig, loadWorkflow } from './lib/config.mjs';
+import { read, write, acquireResource, releaseResource, eligibility } from './lib/state.mjs';
+import { checkReport, classifyExecution, summarize } from './lib/results.mjs';
+import { execute, cleanup, logTail } from './adapters.mjs';
+import { decide } from './lib/dsh.mjs';
 
-const read = (path) => JSON.parse(readFileSync(path, 'utf8'));
-const write = (path, value) => writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
-const cliPath = fileURLToPath(import.meta.url);
-const projectDir = dirname(cliPath);
-const runsDir = join(projectDir, 'runs');
-const workflow = read(join(projectDir, 'workflow.json'));
-const [action, first, second] = process.argv.slice(2);
-const statuses = { passed: 0, failed: 1, incomplete: 2, workflow_error: 3 };
+const project = dirname(fileURLToPath(import.meta.url));
+const args = process.argv.slice(2);
+const optionIndex = args.indexOf('--config');
+const configPath = optionIndex >= 0 ? resolve(args.splice(optionIndex, 2)[1] ?? '') : join(project,'config.json');
+const [action, first, second] = args;
+let config;
 
-function runStep(directory, manifest, id) {
-  const step = workflow.find((entry) => entry.id === id);
-  if (!step) throw new Error('Unknown step: ' + id);
-  const blocked = step.needs.find((dependency) => recordFor(directory, dependency)?.exitCode !== 0);
-  if (blocked) throw new Error(id + ' requires successful step ' + blocked);
-  for (const previous of workflow.slice(0, workflow.indexOf(step))) {
-    const recorded = recordFor(directory, previous.id);
-    const skipped = !recorded && previous.needs.some((dependency) => {
-      const result = recordFor(directory, dependency);
-      return result?.endedAt && result.exitCode !== 0;
-    });
-    if (!recorded?.endedAt && !skipped) {
-      throw new Error(id + ' must wait for step ' + previous.id);
-    }
+function directoryFor(id) {
+  if (!/^[a-f0-9-]{36}$/.test(id ?? '')) throw Error('Invalid run ID');
+  return join(config.runsDir, id);
+}
+function save(manifest, state) { write(join(manifest.directory,'state.json'),state); }
+function violation(manifest, state, step, reason) {
+  state.violations.push({ step, reason, time: new Date().toISOString() });
+  save(manifest,state);
+}
+
+async function runStep(manifest, state, step, signal) {
+  const allowed = eligibility(step,state);
+  if (allowed.kind === 'reject') {
+    violation(manifest,state,step.id,allowed.reason);
+    return;
   }
-  const recordPath = join(directory, id + '.json');
-  const record = { id, startedAt: new Date().toISOString() };
-  writeFileSync(recordPath, JSON.stringify(record), { flag: 'wx' });
+  const record = { state: allowed.kind === 'skip' ? 'skipped' : 'running', startedAt: new Date().toISOString() };
+  state.steps[step.id] = record;
+  save(manifest,state);
   try {
-    const execution = execute(manifest.config, directory, id, manifest.scenario, manifest.runId);
-    record.exitCode = execution.status;
-    record.error = execution.error?.code ?? null;
-    if (execution.error) record.errorMessage = execution.error.message;
+    if (allowed.kind === 'skip') {
+      record.reason = allowed.reason;
+      return;
+    }
+    const execution = await execute(manifest,step,signal);
+    Object.assign(record,execution);
+    const reports = step.reports.map(path => checkReport(join(manifest.output,path)));
+    record.state = classifyExecution(execution,reports);
+    record.reports = reports;
   } catch (error) {
+    record.state = 'incomplete';
     record.exitCode = null;
     record.error = error.code ?? 'EXECUTION_ERROR';
     record.errorMessage = error.message;
   } finally {
     record.endedAt = new Date().toISOString();
-    const completedPath = recordPath + '.completed';
-    write(completedPath, record);
-    renameSync(completedPath, recordPath);
+    save(manifest,state);
+    write(join(manifest.directory,step.id+'.json'),record);
   }
-  console.log(JSON.stringify(record));
-  return record;
+  console.log(JSON.stringify({ runId: manifest.runId, step: step.id, state: record.state, exitCode: record.exitCode }));
 }
 
-function recordFor(directory, id) {
-  const path = join(directory, id + '.json');
-  return existsSync(path) ? read(path) : null;
-}
-
-function finish(directory, manifest, orchestratorExit, cleanupResult) {
-  const build = recordFor(directory, 'build');
-  const test = recordFor(directory, 'test');
-  const archive = recordFor(directory, 'archive');
-  const reportPath = join(directory, 'test-report.json');
-  let report = null;
-  try { report = read(reportPath); } catch {}
-  const skipped = report && Object.hasOwn(report, 'skipped') ? report.skipped : 0;
-  const validReport = report && Number.isInteger(report.checked) && report.checked > 0
-    && Number.isInteger(report.passed) && report.passed >= 0
-    && Number.isInteger(report.failed) && report.failed >= 0
-    && Number.isInteger(skipped) && skipped >= 0
-    && report.passed + report.failed > 0
-    && report.checked === report.passed + report.failed + skipped;
-  const outOfOrder = (test && (!build?.endedAt || build.endedAt > test.startedAt || build.exitCode !== 0))
-    || (archive && (!build?.endedAt || build.endedAt > archive.startedAt
-      || (test && (!test.endedAt || test.endedAt > archive.startedAt))));
-  let status = 'incomplete';
-  let reason = 'required step, report, or orchestrator completion missing';
-  if (outOfOrder) {
-    status = 'workflow_error';
-    reason = 'step order or dependency violated';
-  } else if (orchestratorExit === 0 && archive?.exitCode === 0) {
-    if ((Number.isInteger(build?.exitCode) && build.exitCode !== 0)
-      || (Number.isInteger(test?.exitCode) && test.exitCode !== 0)) {
-      status = 'failed';
-      reason = build.exitCode !== 0 ? 'build failed' : 'test failed';
-    } else if (build?.exitCode === 0 && test?.exitCode === 0 && validReport) {
-      status = report.failed === 0 ? 'passed' : 'failed';
-      reason = report.failed === 0 ? 'all checks passed' : 'assertions failed';
-    }
-  }
-  write(join(directory, 'result.json'), { runId: manifest.runId, status, reason, orchestratorExit,
-    steps: { build, test, archive }, report, cleanup: cleanupResult });
-  console.log(status + ': ' + reason + ' (' + directory + ')');
-  return statuses[status];
-}
-
-try {
-  if (action === 'tail' || action === 'cleanup') {
-    if (!/^[a-f0-9-]{36}$/.test(first ?? '')) throw new Error('Invalid run ID');
-    const directory = join(runsDir, first);
-    const manifest = read(join(directory, 'manifest.json'));
+async function main() {
+  if (['tail','cleanup','step'].includes(action)) {
+    const directory = directoryFor(first);
+    const manifest = read(join(directory,'manifest.json'));
     if (action === 'tail') {
-      if (!workflow.some(({ id }) => id === second)) throw new Error('Unknown step');
-      console.log(logTail(join(directory, second + '.log')));
-    } else {
-      if (manifest.config.adapter !== 'docker') throw new Error('Docker recovery requires a Docker run');
-      const result = cleanup(manifest.runId);
-      write(join(directory, 'recovery.json'), result);
-      console.log(JSON.stringify(result));
-      process.exitCode = result.status === 'clean' ? 0 : 2;
+      if (!manifest.workflow.some(step => step.id === second)) throw Error('Unknown step');
+      console.log(logTail(join(directory,second+'.log')));
+      return 0;
     }
-  } else if (action === 'step') {
-    if (!/^[a-f0-9-]{36}$/.test(first ?? '')) throw new Error('Invalid run ID');
-    const directory = join(runsDir, first);
-    const manifest = read(join(directory, 'manifest.json'));
-    process.exitCode = runStep(directory, manifest, second).exitCode ?? 2;
-  } else if (action === 'run') {
-    const mode = first ?? 'script';
-    const scenario = second ?? 'success';
-    if (!['script', 'dsh'].includes(mode)) throw new Error('Use script or dsh');
-    if (!['success', 'build-failure', 'missing-report', 'timeout', 'verbose'].includes(scenario)) throw new Error('Unknown scenario');
-    const config = {
-      adapter: 'docker', image: 'ucm-cpu-validation:v2', taskScript: 'tasks/mock.sh', timeoutMs: 30000,
-      ...read(join(projectDir, 'config.json')),
-    };
-    config.taskScript = resolve(projectDir, config.taskScript);
-    config.adapter = process.env.REGRESSION_ADAPTER ?? config.adapter;
-    config.image = process.env.REGRESSION_IMAGE ?? config.image;
-    config.timeoutMs = Number(process.env.REGRESSION_TIMEOUT_MS ?? config.timeoutMs);
-    if (!Number.isSafeInteger(config.timeoutMs) || config.timeoutMs < 1) throw new Error('Invalid step timeout');
-    if (!['docker', 'process'].includes(config.adapter)) throw new Error('Invalid adapter');
-    const runId = randomUUID();
-    const directory = join(runsDir, runId);
-    mkdirSync(directory, { recursive: true });
-    const manifest = { runId, mode, scenario, config };
-    write(join(directory, 'manifest.json'), manifest);
-    let orchestratorExit = 0;
-    let cleanupResult;
-    try {
-      if (mode === 'script') {
-        for (const step of workflow) {
-          if (step.needs.every((id) => recordFor(directory, id)?.exitCode === 0)) {
-            runStep(directory, manifest, step.id);
-          }
-        }
-      } else {
-        const prompt = [
-          'Orchestrate this run using only the following task commands from the current directory.',
-          'Execute only the command before the | separator. Run each selected command at most once. Do not edit files or retry.',
-          'Visit the steps in the exact order shown below. Wait for each invoked step to finish. Skip a step if any listed dependency did not exit 0.',
-          ...workflow.map(({ id, needs }) => 'node cli.mjs step ' + runId + ' ' + id + ' | dependencies: ' + (needs.join(', ') || 'none')),
-          'For diagnostics use only the bounded log command: node cli.mjs tail ' + runId + ' <step>. Do not read raw logs.',
-          'Summarize the actual calls and outputs. Run ID: ' + runId,
-        ].join('\n');
-        const result = runLogged(config.dsh.command, [...config.dsh.args, prompt], join(directory, 'dsh.log'), {
-          cwd: projectDir, timeout: config.dsh.timeoutMs,
-        });
-        orchestratorExit = result.status;
-      }
-    } catch (error) {
-      orchestratorExit = null;
-      write(join(directory, 'orchestrator-error.json'), { message: error.message });
-    } finally {
-      cleanupResult = config.adapter === 'docker' ? cleanup(runId) : { status: 'not_applicable' };
+    if (action === 'step') {
+      // Step execution is owned by one controller. Independent callers must not race its state.
+      const event = { step: second, reason: 'External step requests are unsupported', time: new Date().toISOString() };
+      write(join(directory,'external-violation-'+randomUUID()+'.json'),event);
+      throw Object.assign(Error(event.reason),{exitCode:3});
     }
-    process.exitCode = finish(directory, manifest, orchestratorExit, cleanupResult);
-  } else {
-    throw new Error('Usage: node cli.mjs run [script|dsh] [success|build-failure|missing-report]');
+    if (manifest.pid) {
+      let alive = false;
+      try { process.kill(manifest.pid,0); alive = true; } catch (error) { alive = error.code !== 'ESRCH'; }
+      if (alive) throw Error('Controller may still be alive; recovery refused');
+    }
+    const result = await cleanup(manifest);
+    write(join(directory,'recovery.json'),result);
+    if (result.status === 'clean' && manifest.resourceLock) releaseResource(manifest.resourceLock,manifest.runId);
+    console.log(JSON.stringify(result));
+    return result.status === 'clean' ? 0 : 2;
   }
-} catch (error) {
-  console.error(error.message);
-  process.exitCode = 2;
+  if (action !== 'run') throw Error('Usage: node cli.mjs run script|dsh [scenario] [--config path]');
+  const mode = first ?? 'script';
+  if (!['script','dsh'].includes(mode)) throw Error('Invalid orchestrator');
+  const workflow = loadWorkflow(config.workflow);
+  const runId = randomUUID();
+  const directory = join(config.runsDir,runId);
+  const resourceLock = acquireResource(config.runsDir,config.resourceKey,runId);
+  const state = { status:'running', steps:{}, violations:[], interrupted:false, orchestratorError:null };
+  const manifest = { runId, mode, directory, output:join(directory,'output'), config, workflow,
+    scenario:second ?? 'success', resourceLock, pid:process.pid };
+  const aborter = new AbortController();
+  const interrupt = () => {
+    state.interrupted = true;
+    state.status = 'stopping';
+    aborter.abort();
+  };
+  process.on('SIGINT',interrupt);
+  process.on('SIGTERM',interrupt);
+  let cleaned = {status:'unverified'};
+  try {
+    mkdirSync(manifest.output,{recursive:true});
+    write(join(directory,'manifest.json'),manifest);
+    save(manifest,state);
+    console.log('RUN_ID=' + runId);
+    if (mode === 'script') {
+      for (const step of workflow) {
+        if (aborter.signal.aborted) break;
+        await runStep(manifest,state,step,aborter.signal);
+      }
+    } else {
+      let finished = false, preview = null;
+      for (let turn=0; turn<config.dsh.maxDecisions && !aborter.signal.aborted; turn++) {
+        const decision = await decide(manifest,state,turn,aborter.signal,preview);
+        preview = null;
+        write(join(directory,'decision-'+turn+'.json'),decision);
+        if (decision.action === 'finish') {
+          if (workflow.some(step => !state.steps[step.id] || state.steps[step.id].state === 'running')) {
+            violation(manifest,state,null,'Premature finish');
+          }
+          finished = true;
+          break;
+        }
+        const step = workflow.find(step => step.id === decision.step);
+        if (!step) {
+          violation(manifest,state,decision.step ?? null,'Unknown step');
+          break;
+        }
+        if (decision.action === 'run') await runStep(manifest,state,step,aborter.signal);
+        else if (decision.action === 'tail' && state.steps[step.id]?.endedAt) {
+          preview = { step:step.id, text:logTail(join(directory,step.id+'.log')) };
+        } else violation(manifest,state,step.id,'Invalid action or log request');
+        if (state.violations.length) break;
+      }
+      if (!finished && !state.violations.length && !state.interrupted) state.orchestratorError = 'Decision limit exceeded';
+    }
+  } catch (error) {
+    state.orchestratorError = error.message;
+  } finally {
+    state.status = 'closing';
+    if (existsSync(directory)) {
+      save(manifest,state);
+      cleaned = await cleanup(manifest);
+      // Independent CLI attempts are durable and count as workflow violations.
+      const { readdirSync } = await import('node:fs');
+      for (const name of readdirSync(directory).filter(n=>n.startsWith('external-violation-'))) {
+        state.violations.push(read(join(directory,name)));
+      }
+      state.status = 'closed';
+      save(manifest,state);
+    }
+    if (cleaned.status === 'clean') releaseResource(resourceLock,runId);
+    process.removeListener('SIGINT',interrupt);
+    process.removeListener('SIGTERM',interrupt);
+  }
+  const result = summarize(manifest,state,cleaned);
+  write(join(directory,'result.json'),result);
+  console.log(JSON.stringify({runId,status:result.status,exitCode:result.exitCode,directory}));
+  return result.exitCode;
 }
+
+try { config = loadConfig(configPath); process.exitCode = await main(); }
+catch(error) { console.error(error.message); process.exitCode = error.exitCode ?? 2; }
