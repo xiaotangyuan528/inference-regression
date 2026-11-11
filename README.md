@@ -1,5 +1,7 @@
 # 推理回归测试框架原型
 
+[详细设计文档](docs/design.md)介绍架构、编排分工、任务接口和验证范围。
+
 ## 本机快速验证
 
 在此目录打开 PowerShell。需要 Node.js 和已启动的 Docker Desktop。默认使用本机已有的 ucm-cpu-validation:v2 镜像作为运行环境。模拟任务只用 /bin/sh，不下载镜像、不联网。
