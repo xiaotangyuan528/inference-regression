@@ -1,5 +1,5 @@
-import { readdirSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as wait } from 'node:timers/promises';
 
@@ -67,55 +67,109 @@ function delta(before, after) {
   return result;
 }
 
-try {
-  await request('/health');
-  const models = JSON.parse(await request('/v1/models'));
-  save('models.json', models);
-  if (!models.data.some(model => model.id === modelName)) throw Error('Expected model absent: ' + modelName);
-
-  const code = 'BLUE-' + randomUUID().slice(0, 8);
-  const context = Array.from({ length: 80 }, (_, index) =>
-    'Record ' + (index + 1) + ': the archive contains ordinary weather observations.').join('\n');
-  const payload = {
-    model: modelName,
-    messages: [
-      { role: 'system', content: 'Reply with exactly this verification code: ' + code },
-      { role: 'user', content: context + '\nReply with only this verification code: ' + code },
-    ],
-    temperature: 0, max_tokens: 32, stream: false,
-  };
+async function readback(id) {
+  if (!/^[0-9a-f-]{36}$/.test(id)) throw Error('Invalid write run ID');
+  const source = join(dirname(dirname(out)), id);
+  const read = (directory, file) => JSON.parse(readFileSync(join(directory, file), 'utf8'));
+  if (read(source, 'result.json').status !== 'passed') throw Error('Write run did not pass');
+  const artifacts = join(source, 'output');
+  if (read(artifacts, 'test-report.json').checks?.kvclient_write_observed !== true) {
+    throw Error('Source run has no confirmed write');
+  }
+  const payload = read(artifacts, 'request.json');
+  if (payload.model !== modelName) throw Error('Source model differs from configured model');
+  const expected = read(artifacts, 'response-1.json').choices[0].message.content;
   save('request.json', payload);
   const before = await snapshot('before');
-  const observations = [];
-  let previous = before;
-  for (const index of [1, 2]) {
-    const reply = JSON.parse(await request('/v1/chat/completions', payload));
-    save('response-' + index + '.json', reply);
-    await wait(3000);
-    const after = await snapshot('after-' + index);
-    const oldFiles = new Set(previous.files);
-    observations.push({
-      answer: reply.choices[0].message.content,
-      newFiles: after.files.filter(file => !oldFiles.has(file)),
-      deltas: delta(previous, after),
-    });
-    previous = after;
+  const reply = JSON.parse(await request('/v1/chat/completions', payload));
+  save('response-1.json', reply);
+  await wait(3000);
+  const after = await snapshot('after-1');
+  const changes = delta(before, after);
+  const newlyExposed = {};
+  for (const [series, value] of after.counters) {
+    if (before.counters.has(series)) continue;
+    const name = series.split('{', 1)[0];
+    newlyExposed[name] = (newlyExposed[name] ?? 0) + value;
   }
-  save('observations.json', observations);
-  if (!(writeMetric in observations[0].deltas)) throw Error('Missing baseline kvclient write counter');
-
+  save('readback-observations.json', { writeRunId: id, changes, newlyExposed });
+  const observed = name => (changes[name] ?? 0) + (newlyExposed[name] ?? 0);
+  const errors = ['ucm:asu_load_submit_errors_total', 'ucm:asu_wait_errors_total',
+    'ucm:asu_wait_timeouts_total'];
   const checks = {
-    first_answer: observations[0].answer?.trim() === code,
-    second_answer: observations[1].answer?.trim() === code,
-    kvclient_write_observed: observations[0].deltas[writeMetric] > 0
-      && observations[0].newFiles.length > 0,
+    answer_matches: typeof expected === 'string' && expected.length > 0
+      && reply.choices[0].message.content?.trim() === expected.trim(),
+    external_hit: (changes['vllm:external_prefix_cache_hits_total'] ?? 0) > 0
+      && observed('ucm:asu_lookup_prefix_hit_blocks_total') > 0,
+    kvclient_load_observed: observed('kv:kv_client_load_requests_total') > 0
+      && observed('ucm:asu_load_submitted_bytes_total') > 0,
+    wait_observed: observed('ucm:asu_wait_requests_total') > 0,
+    no_observed_load_or_wait_errors: errors.every(name => observed(name) === 0),
   };
-  const checked = Object.keys(checks).length;
   const passed = Object.values(checks).filter(Boolean).length;
-  const report = { checked, passed, failed: checked - passed, checks, cache_readback: 'not_verified' };
+  if (errors.some(name => !(name in changes) && !(name in newlyExposed))) {
+    throw Error('Readback observed, but load/wait error counters are not all exposed');
+  }
+  const report = { checked: Object.keys(checks).length, passed,
+    failed: Object.keys(checks).length - passed, checks, write_run_id: id };
   save('test-report.json', report);
   console.log(JSON.stringify(report));
   process.exitCode = report.failed ? 1 : 0;
+}
+
+try {
+  await request('/health');
+  if (process.env.UCM_WRITE_RUN_ID !== undefined) {
+    await readback(process.env.UCM_WRITE_RUN_ID);
+  } else {
+    const models = JSON.parse(await request('/v1/models'));
+    save('models.json', models);
+    if (!models.data.some(model => model.id === modelName)) throw Error('Expected model absent: ' + modelName);
+
+    const code = 'BLUE-' + randomUUID().slice(0, 8);
+    const context = Array.from({ length: 80 }, (_, index) =>
+      'Record ' + (index + 1) + ': the archive contains ordinary weather observations.').join('\n');
+    const payload = {
+      model: modelName,
+      messages: [
+        { role: 'system', content: 'Reply with exactly this verification code: ' + code },
+        { role: 'user', content: context + '\nReply with only this verification code: ' + code },
+      ],
+      temperature: 0, max_tokens: 32, stream: false,
+    };
+    save('request.json', payload);
+    const before = await snapshot('before');
+    const observations = [];
+    let previous = before;
+    for (const index of [1, 2]) {
+      const reply = JSON.parse(await request('/v1/chat/completions', payload));
+      save('response-' + index + '.json', reply);
+      await wait(3000);
+      const after = await snapshot('after-' + index);
+      const oldFiles = new Set(previous.files);
+      observations.push({
+        answer: reply.choices[0].message.content,
+        newFiles: after.files.filter(file => !oldFiles.has(file)),
+        deltas: delta(previous, after),
+      });
+      previous = after;
+    }
+    save('observations.json', observations);
+    if (!(writeMetric in observations[0].deltas)) throw Error('Missing baseline kvclient write counter');
+
+    const checks = {
+      first_answer: observations[0].answer?.trim() === code,
+      second_answer: observations[1].answer?.trim() === code,
+      kvclient_write_observed: observations[0].deltas[writeMetric] > 0
+        && observations[0].newFiles.length > 0,
+    };
+    const checked = Object.keys(checks).length;
+    const passed = Object.values(checks).filter(Boolean).length;
+    const report = { checked, passed, failed: checked - passed, checks, cache_readback: 'not_verified' };
+    save('test-report.json', report);
+    console.log(JSON.stringify(report));
+    process.exitCode = report.failed ? 1 : 0;
+  }
 } catch (error) {
   save('probe-error.json', { message: error.message });
   console.error(error.message);
