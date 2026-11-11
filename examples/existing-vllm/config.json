@@ -1,0 +1,8 @@
+{
+  "adapter": "process",
+  "taskScript": "task.sh",
+  "workflow": "workflow.json",
+  "runsDir": "../../runs",
+  "resourceKey": "existing-vllm",
+  "timeoutMs": 420000
+}
