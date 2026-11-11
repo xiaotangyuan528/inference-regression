@@ -1,116 +1,80 @@
-# 推理服务回归测试框架设计
+# Workflow 执行与可信结果设计
 
-## 1. 目标与现状
+## 职责
 
-将推理服务的构建、启动、请求验证和结果归档整理为可复用的执行流程。首个目标场景是 UCM＋kvclient 每日功能看护。使用者可以先用模拟任务熟悉流程，再通过配置选择执行环境和任务入口。
-
-| 能力 | 状态 |
-| --- | --- |
-| 脚本编排与 Docker 执行 | 本机已验证正常、构建失败、报告缺失、大日志和步骤超时 |
-| dsh 分步骤编排 | 已提供入口，真实 dsh 分支行为和 Web UI 追踪待验证 |
-| Linux 进程适配 | 已提供入口，迁入 Genet Pod 待验证 |
-| UCM＋kvclient 专项 | 早期原型验证过模拟后端读写。专项任务尚未接入本仓库，真实推理缓存链路待验收 |
-
-## 2. 架构
-
-Workflow 定义步骤顺序及依赖关系。控制层选择下一步，环境层启动进程或容器，任务层执行具体操作。各层以运行编号关联日志、步骤记录和最终报告。
+| 层 | 职责 | 实现 |
+| --- | --- | --- |
+| 控制 | 接受触发、读取 Workflow、决定或接受下一步建议、管理状态 | cli.mjs、lib/state.mjs、lib/dsh.mjs |
+| 环境 | 启动进程/容器、超时终止、资源回收 | adapters.mjs |
+| 任务 | 构建、测试、输出原始报告 | tasks/ |
 
 ```mermaid
-flowchart TB
-    TR["人工触发 / 外部调度"] --> CLI
-    WF["Workflow<br/>步骤与依赖"] --> SC
-    WF --> DS
-    subgraph C["控制层"]
-        CLI["CLI<br/>配置与运行编号"]
-        SC["脚本编排"]
-        DS["dsh 编排<br/>待实测"]
-        V["结果校验"]
-        CLI --> SC
-        CLI --> DS
-    end
-    subgraph E["环境层"]
-        EX["执行适配"]
-        DO["Docker"]
-        PO["Linux 进程 / 已申请的 Pod"]
-        EX --> DO
-        EX --> PO
-    end
-    subgraph T["任务层"]
-        MO["模拟构建、测试和归档"]
-        UC["UCM＋kvclient 专项<br/>待接入"]
-    end
-    SC --> EX
-    DS --> EX
-    EX --> MO
-    EX -.-> UC
-    EX --> R[("步骤日志与运行报告")]
-    R --> V
-    DS -.-> UI["dsh Web UI<br/>会话关联待实测"]
-    classDef control fill:#EAF2FF,stroke:#3267A8,color:#172B4D;
-    classDef environment fill:#E8F5EF,stroke:#33825C,color:#173D2C;
-    classDef task fill:#FFF4E5,stroke:#B87920,color:#513812;
-    classDef shared fill:#F4F4F4,stroke:#888888,color:#333333;
-    class TR,WF,CLI,SC,DS,V,UI control;
-    class EX,DO,PO environment;
-    class MO,UC task;
-    class R shared;
+flowchart TD
+  trigger[人工 / 外部定时触发] --> controller[控制层：运行状态与协议校验]
+  workflow[Workflow 快照] --> controller
+  controller --> choice{下一步来源}
+  choice --> script[确定性顺序]
+  choice --> agent[dsh 隔离决策容器]
+  script --> guard[依赖与生命周期校验]
+  agent --> guard
+  guard --> adapter[环境层：Docker / 前台进程]
+  adapter --> task[任务层：构建 / 测试 / 归档]
+  task --> report[原始退出码与报告]
+  report --> controller
+  controller --> final[清理复查与最终结果]
 ```
 
-蓝色为控制层，绿色为环境层，橙色为任务层，灰色为共享运行记录。
+Agent 可选择下一步或请求有限日志，但无权直接写宿主运行记录。
+这是受约束的步骤编排，不是允许 Agent 自由执行任意宿主命令。
+脚本与 Agent 共用依赖校验、执行器和最终判定。
 
-| 文件 | 职责 |
-| --- | --- |
-| [cli.mjs](../cli.mjs) | 读取配置、发起运行、调用步骤、记录并校验结果 |
-| [workflow.json](../workflow.json) | 定义 `build`、`test`、`archive` 的顺序与依赖 |
-| [adapters.mjs](../adapters.mjs) | 启动 Docker 或 Linux 进程，保存日志，检查并清理 Docker 容器 |
-| [tasks/mock.sh](../tasks/mock.sh) | 提供可复现的模拟任务与故障输入 |
-| [config.json](../config.json) | 设置镜像、适配器、任务脚本和超时 |
+## 状态与结果
 
-## 3. 编排与任务接口
+一个运行只由一个控制器写状态。开始前取得同 runsDir/resourceKey 的独占文件锁。
+步骤处于 running、succeeded、failed、incomplete 或 skipped。
+needs 是成功依赖，after 是完成依赖。依赖尚未结束时拒绝调用，依赖失败时记录合法跳过。
+重复、乱序或未知步骤记为持久违规，最终退出 3，不能通过后来补跑洗掉。
 
-脚本模式按 Workflow 顺序检查依赖并调用步骤。dsh 模式把 Workflow 的步骤及依赖传给 dsh，由 dsh 选择并逐次调用 `node cli.mjs step <run_id> <step>`。两个入口运行同一任务脚本。步骤入口在执行前校验依赖和顺序。测试要求构建成功，归档等待前序步骤结束或因依赖失败而跳过。最终校验检查实际步骤记录，dsh 摘要用于查看运行经过。
+Workflow 在启动时校验并快照。最终结果遍历快照中的全部步骤，不能只检查固定三个名字。
+有效报告要求计数自洽且有实际执行；全跳过、无报告或异常退出均不变成绿灯。
+本地文件不是防宿主管理员篡改的安全审计存储，任务本身也必须可信。
 
-任务脚本接收步骤名和场景名，通过 `RUN_OUTPUT` 获取共享结果目录。构建产物或测试输入需写入共享目录，供后续容器读取。退出码记录步骤执行结果。测试步骤另写 `test-report.json`，其中 `checked`、`passed`、`failed` 为整数，可选的 `skipped` 为非负整数。总数等于通过、失败和跳过之和，并要求至少一项实际执行。首版最终校验以三个固定步骤为准，增加步骤时应同步明确依赖和最终判定规则。
+任务产物位于 output/，控制记录位于父目录，Docker 任务不获得父目录写权限。
+最终退出优先级为编排错误 3、运行不完整 2、已确认测试失败 1、成功 0。
+清理剩余或无法核验属于不完整；原始步骤退出码和报告仍保留。
 
-Docker 为每个步骤启动独立容器，挂载只读任务脚本和可写输出目录，使用本地镜像并关闭容器网络。真实引擎和请求测试需要在同一生命周期内运行，或显式提供可达服务、共享工作区和资源清理方式。Linux 进程适配可用于已申请的 Pod，Genet 的资源申请和回收接口留待实际接入。
+## 异常与清理
 
-## 4. 配置与日志
+子进程使用异步 spawn，正常信号可进入停止处理。Linux 终止受控进程组，
+Windows 使用 taskkill /T /F 并设直接终止兜底。
+Docker 采用 create → start → inspect，区分启动故障与容器内命令退出。
+所有任务容器和决策容器带 run_id 标签；最终删除并重新查询确认。
 
-配置优先级为环境变量、配置文件、内置默认值。当前支持 `REGRESSION_ADAPTER`、`REGRESSION_IMAGE` 和 `REGRESSION_TIMEOUT_MS` 覆盖对应字段。换任务时修改 `taskScript`。模型路径、设备参数和后端配置随专项任务接入，并由运行环境提供。运行配置会写入 manifest，凭据通过执行环境注入。
+强制终止控制器时可能留下容器和锁。这种情况必须执行 cleanup，不能宣称自动清理必然发生。
+PID 可能复用，恢复入口因此采用保守拒绝策略，必要时由运维确认占用者。
+process 适配器不追踪任务主动后台化后的任意外部进程；生产优先使用容器/平台资源边界。
+跨机器锁、Pod TTL、节点失联恢复需要目标平台实现，本次未实现。
 
-内置配置、Workflow、相对任务路径与运行目录均以项目目录为基准。执行器抛出异常时，步骤记录仍会写入结束时间和错误信息，退出码保留为 `null`。
+## 配置和路径
 
-每次运行在 `runs/<run_id>/` 下保留：
+默认配置从 CLI 安装位置读取。显式 --config 相对调用者目录解析。
+任务脚本、工作目录、Workflow、结果目录与挂载源均相对配置目录解析。
+宿主挂载源保留宿主平台路径，容器内使用 /task.sh 和 /out；不能把 Windows 源路径盲目转为 Linux 路径。
+Docker bind 路径中含逗号或双引号会明确拒绝，避免参数被误解析。
+输出目录必须可写；只读源码可通过 mounts 提供，不要求源码目录可写。
+只改配置能替换已有适配器和任务；新增平台生命周期仍需适配代码。
 
-| 文件 | 用途 |
-| --- | --- |
-| `manifest.json` | 运行编号、编排模式、场景及生效配置 |
-| `build.json` 等步骤记录 | 开始时间、结束时间、退出码与执行错误 |
-| `build.log` 等日志 | 直接写入的 stdout 和 stderr |
-| `test-report.json` | 原始测试统计 |
-| `dsh.log` | dsh 模式的输出 |
-| `result.json` | 最终状态、步骤结果和清理记录 |
-| `recovery.json` | 手动清理命令的结果 |
+## dsh 迁移
 
-dsh 默认收到简短步骤记录。排查时用 `node cli.mjs tail <run_id> <step>` 查看日志末尾，最多读取 4 KiB、返回 50 行。该预览是调用约定，模型进程的文件访问仍取决于执行权限。Genet 验收时检查能否用运行编号或会话映射串起 dsh 调用、Pod 日志与最终报告。
+旧版让宿主 dsh 执行 node cli.mjs step。新版禁止该入口执行任务，调用返回 3。
+dsh.command 改为镜像内命令数组，新增 dsh.image。
+不再使用宿主 dsh.args 或本机可执行文件路径。
+每次决策传入 Workflow、步骤状态和可选有限日志，输出单行 JSON：
+run + step、tail + step 或 finish。控制器永远保留执行和判定权。
 
-## 5. 失败处理与清理
+决策容器使用只读根目录、临时 /tmp、去能力、禁止提权，不挂载宿主数据或 Docker socket。
+这限制文件访问，但不是网络数据防泄漏方案；模型接口访问需要独立网络策略。
+Agent 输入可能包含敏感日志，实际任务必须另做脱敏。模型密钥仅通过指定环境变量注入。
+日志限制降低上下文膨胀，完整日志磁盘保留仍需外部保留期与配额。
 
-| 场景 | 结果 |
-| --- | --- |
-| 构建、测试及归档完成，报告有效且无失败 | `passed`，退出 0 |
-| 构建返回非零，跳过测试并完成归档 | `failed`，退出 1 |
-| 报告缺失、零用例、步骤超时或编排未完成 | `incomplete`，退出 2 |
-| 实际步骤违反已检查的顺序或依赖 | `workflow_error`，退出 3 |
-
-Docker 资源按运行编号打标签。外层收尾时检查并清理同一次运行的容器，再查询剩余资源。清理结果独立记录为 `clean`、`remaining` 或 `unverified`。外层进程被强制终止后，可在确认该运行已停止后执行 `node cli.mjs cleanup <run_id>`。Pod 回收和真实 dsh 中断仍需实测。
-
-## 6. 验证与扩展
-
-1. **本机复现。** 按 [README](../README.md) 跑正常、构建失败和报告缺失。构建失败时核对退出码为 7、测试未启动、归档完成。
-2. **dsh 对照。** 使用同一配置和故障输入切换到 dsh。核对实际步骤、分支决策、最终状态，并记录耗时和人工介入。
-3. **Genet 迁移。** 在已申请的 Pod 上运行固定版本，验证入口可执行、报告可持久化、资源可回收。
-4. **UCM 专项验收。** 在支持的引擎、设备和后端组合上发起请求，用 kvclient 侧日志、指标或断言证明缓存写入、命中和回读，并核对推理结果。测试需控制引擎自身缓存的影响。
-5. **每日看护。** 固定本次源码提交和制品身份，接入外部调度、持久化归档和失败通知。真实用例稳定后，以同一入口扩展其他引擎和环境。
-
-复用已有任务时，改配置即可切换镜像和超时。新增引擎、缓存后端或资源平台时，补充任务或适配逻辑。复用验收由另一位使用者按 README 独立跑通成功和失败用例，并从运行编号找到原始日志和报告。
+协议模拟已验证；真实 dsh 镜像参数、模型接入及 Web UI 仍是待验收项。
