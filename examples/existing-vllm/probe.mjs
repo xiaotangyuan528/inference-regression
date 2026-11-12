@@ -158,16 +158,24 @@ try {
         answer: reply.choices[0].message.content,
         newFiles: after.files.filter(file => !oldFiles.has(file)),
         deltas: delta(previous, after),
+        newWriteCounterValues: [...after.counters].filter(([series]) =>
+          series.split('{', 1)[0] === writeMetric && !previous.counters.has(series)
+        ).map(([, value]) => value),
       });
       previous = after;
     }
     save('observations.json', observations);
-    if (!(writeMetric in observations[0].deltas)) throw Error('Missing baseline kvclient write counter');
+    const first = observations[0];
+    const coldStart = process.env.UCM_MANAGED_COLD_START === '1';
+    const newWrites = coldStart ? first.newWriteCounterValues.reduce((sum, value) => sum + value, 0) : 0;
+    if (!(writeMetric in first.deltas) && !(coldStart && first.newWriteCounterValues.length)) {
+      throw Error('No usable kvclient write counter');
+    }
 
     const checks = {
       first_answer: observations[0].answer?.trim() === code,
       second_answer: observations[1].answer?.trim() === code,
-      kvclient_write_observed: observations[0].deltas[writeMetric] > 0
+      kvclient_write_observed: ((first.deltas[writeMetric] ?? 0) + newWrites) > 0
         && observations[0].newFiles.length > 0,
     };
     const checked = Object.keys(checks).length;
