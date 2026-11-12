@@ -1,0 +1,10 @@
+{
+  "adapter": "process",
+  "taskScript": "managed-task.sh",
+  "cleanupScript": "managed-task.sh",
+  "workflow": "managed-workflow.json",
+  "runsDir": "../../runs",
+  "resourceKey": "managed-ascend",
+  "timeoutMs": 1000000,
+  "taskShell": "bash"
+}
