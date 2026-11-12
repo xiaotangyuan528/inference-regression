@@ -84,7 +84,7 @@ case "$1" in
   write)
     unset UCM_WRITE_RUN_ID UCM_WRITE_ARTIFACTS
     mkdir -p "$session/write"
-    RUN_OUTPUT="$session/write" node "$task_dir/probe.mjs" ;;
+    UCM_MANAGED_COLD_START=1 RUN_OUTPUT="$session/write" node "$task_dir/probe.mjs" ;;
   restart) stop_engine; prepare; start_engine readback-engine ;;
   readback)
     mkdir -p "$session/readback"
