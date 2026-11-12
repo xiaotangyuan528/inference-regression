@@ -136,6 +136,20 @@ async function main() {
           preview = { step:step.id, text:logTail(join(directory,step.id+'.log')) };
         } else violation(manifest,state,step.id,'Invalid action or log request');
         if (state.violations.length) break;
+        if (workflow.some(({ id }) => ['failed', 'incomplete'].includes(state.steps[id]?.state))) {
+          // Blocked steps are a deterministic consequence of failed dependencies.
+          for (const pending of workflow) {
+            if (!state.steps[pending.id] && eligibility(pending, state).kind === 'skip') {
+              await runStep(manifest, state, pending, aborter.signal);
+            }
+          }
+          if (workflow.every(({ id }) => state.steps[id]?.endedAt)) {
+            state.controllerStopReason = 'All remaining work blocked by unsuccessful dependencies';
+            save(manifest, state);
+            finished = true;
+            break;
+          }
+        }
       }
       if (!finished && !state.violations.length && !state.interrupted) state.orchestratorError = 'Decision limit exceeded';
     }
