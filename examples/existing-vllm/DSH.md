@@ -1,47 +1,54 @@
-# Run the managed workflow with DSH
+# 使用 DSH 执行四步 Workflow
 
-Use a Linux Pod with the existing vLLM/ASU FAKE setup, Python with PyYAML,
-Node.js compatible with your DSH release, and an authorized Anthropic-compatible
-model gateway. The test uses a dedicated NPU, an independent cache directory,
-and port 18000 by default. Set UCM_TEST_PORT to use another free port.
+## 运行前提
+
+在 Linux Pod 中准备可用的 vLLM 和 ASU FAKE 后端、安装了 PyYAML 的 Python、与当前 DSH 版本兼容的 Node.js，以及已获准调用的 Anthropic 兼容模型网关。
+
+测试需要一张已分配的空闲 NPU。每次运行使用独立缓存目录，测试引擎默认监听 18000。可通过 `UCM_TEST_PORT` 指定其他空闲端口。
+
+## 在 Pod 中运行
+
+确认 `dsh` 在 `PATH` 中，也可以用 `UCM_DSH_BIN` 指定可执行文件路径。将下方占位值替换为实际配置。
 
 ```bash
-cd /path/to/inference-regression
-git pull --ff-only origin main
-
+cd /path/to/inference-regression &&
+git pull --ff-only origin main &&
 (
   set -e
-  export UCM_TEST_NPU='<allocated idle NPU>'
-  export UCM_DSH_UPSTREAM='<full authorized /v1/messages URL>'
-  export UCM_DSH_MODEL='<gateway model ID>'
-  read -rs -p 'Gateway API key: ' UCM_DSH_API_KEY
+  export UCM_TEST_NPU='<已分配的空闲 NPU 编号>'
+  export UCM_DSH_UPSTREAM='<获准调用的完整 /v1/messages 地址>'
+  export UCM_DSH_MODEL='<网关模型 ID>'
+  read -rs -p '请输入网关 API Key: ' UCM_DSH_API_KEY
   printf '\n'
   export UCM_DSH_API_KEY
   node examples/existing-vllm/run-dsh.mjs
 )
 ```
 
-Ensure dsh is on PATH or set UCM_DSH_BIN. The launcher binds an ephemeral
-loopback port and gives the child a per-run proxy key. The upstream key is
-read from the launch environment and is not written to the generated patch.
-The proxy buffers responses, adds missing Anthropic SSE event names, and
-retries a zero-byte HTTP 200 SSE response once.
+启动入口在本机回环地址上分配临时端口，使用本次运行专用的代理密钥连接 DSH 和代理。上游 API Key 从环境变量读取。代理缓冲响应，为缺少事件名的 Anthropic SSE 事件补齐 `event:` 行。收到 HTTP 200、SSE 响应头且响应体为零字节时，代理补发一次。
 
-The managed Workflow runs start, write, restart, and readback. DSH proposes
-each decision and the framework validates and executes it. Verify exit 0,
-four successful steps, clean engine cleanup, and the final finish decision.
-Inspect runs/<run-id>/result.json, decision-*.json and the reports in
-output/write and output/readback. DSH_GATEWAY_EVIDENCE identifies the
-directory containing proxy metadata.
+## 查看结果
 
-For the deterministic comparison, use the same environment and run:
+Workflow 依次启动引擎、写入缓存、重启引擎并回读缓存。DSH 提出下一步决策，框架负责校验依赖、执行任务和清理引擎。
+
+验收时确认四个步骤均成功，最终退出码为 `0`，清理状态为 `clean`，且最后一条决策为 `finish`。
+
+| 文件 | 内容 |
+| --- | --- |
+| `runs/<运行编号>/result.json` | 步骤状态、退出码和清理结果 |
+| `runs/<运行编号>/decision-*.json` | DSH 的逐步决策 |
+| `runs/<运行编号>/output/write/test-report.json` | 缓存写入报告 |
+| `runs/<运行编号>/output/readback/test-report.json` | 缓存回读报告 |
+| `DSH_GATEWAY_EVIDENCE` 指向的目录 | 代理请求结果与兼容处理记录 |
+
+## 用 script 模式对照
+
+在同一环境中，设置相同的 `UCM_TEST_NPU` 和测试端口后运行：
 
 ```bash
 node cli.mjs run script success --config examples/existing-vllm/managed-config.json
 ```
 
-The four-step DSH flow passed in the target Pod with the earlier diagnostic
-proxy. This packaged launcher was checked with a simulated gateway, including
-SSE framing and retry, and still needs a run in the target Pod. Write failure,
-illegal decision and DSH timeout with engine cleanup remain separate acceptance
-cases.
+## 验证进度
+
+真实 DSH 四步流程已使用此前的诊断代理在目标 Pod 上通过。仓库封装入口已用模拟网关验证 SSE 修正和零字节响应补发，仍待目标 Pod 实测。写入失败、非法决策和 DSH 超时后的引擎清理也待验收。
