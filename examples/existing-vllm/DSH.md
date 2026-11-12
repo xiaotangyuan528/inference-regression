@@ -51,4 +51,6 @@ node cli.mjs run script success --config examples/existing-vllm/managed-config.j
 
 ## 验证进度
 
-真实 DSH 四步流程已使用此前的诊断代理在目标 Pod 上通过。仓库封装入口已用模拟网关验证 SSE 修正和零字节响应补发，仍待目标 Pod 实测。写入失败、非法决策和 DSH 超时后的引擎清理也待验收。
+仓库一键入口已在 Linux ARM64 昇腾 Pod 上实测通过。真实 DSH 完成启动、写入、重启和回读，写入 3/3、回读 5/5，最终退出码为 `0`，框架报告清理状态为 `clean`。
+
+写入失败、非法决策和 DSH 超时后的引擎清理仍待验收。
