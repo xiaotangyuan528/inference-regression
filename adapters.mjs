@@ -63,7 +63,7 @@ const label = runId => 'inference-regression.run=' + runId;
 export async function execute(manifest, step, signal) {
   const { config, output, directory, runId, scenario } = manifest;
   if (config.adapter === 'process') {
-    return runLogged('sh', [config.taskScript, step.id, scenario], join(directory, step.id + '.log'), {
+    return runLogged(config.taskShell ?? 'sh', [config.taskScript, step.id, scenario], join(directory, step.id + '.log'), {
       signal, timeoutMs: config.timeoutMs, cwd: config.taskCwd,
       env: { ...process.env, RUN_OUTPUT: output, RUN_ID: runId },
     });
@@ -111,7 +111,14 @@ export async function container(manifest, id, args, timeoutMs, signal) {
 }
 
 export async function cleanup(manifest) {
-  if (manifest.config.adapter === 'process' && manifest.mode !== 'dsh') {
+  const { config, directory, output, runId } = manifest;
+  if (config.adapter === 'process' && config.cleanupScript) {
+    const result = await runLogged('bash', [config.cleanupScript, 'cleanup'], join(directory, 'cleanup-task.log'), {
+      timeoutMs: 30000, cwd: config.taskCwd, env: { ...process.env, RUN_OUTPUT: output, RUN_ID: runId },
+    });
+    if (result.exitCode !== 0 || result.error) return { status: 'unverified', ...result };
+  }
+  if (manifest.config.adapter === 'process' && (manifest.mode !== 'dsh' || manifest.config.dsh.execution === 'process')) {
     return { status: 'clean', scope: 'tracked foreground processes; task-created external resources require task cleanup' };
   }
   const list = async suffix => {
