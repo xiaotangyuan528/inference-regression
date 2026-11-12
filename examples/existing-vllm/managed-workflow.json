@@ -1,0 +1,32 @@
+[
+  {
+    "id": "start",
+    "needs": [],
+    "reports": []
+  },
+  {
+    "id": "write",
+    "needs": [
+      "start"
+    ],
+    "reports": [
+      "write/test-report.json"
+    ]
+  },
+  {
+    "id": "restart",
+    "needs": [
+      "write"
+    ],
+    "reports": []
+  },
+  {
+    "id": "readback",
+    "needs": [
+      "restart"
+    ],
+    "reports": [
+      "readback/test-report.json"
+    ]
+  }
+]
