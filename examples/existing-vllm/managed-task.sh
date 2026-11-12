@@ -84,6 +84,11 @@ case "$1" in
   write)
     unset UCM_WRITE_RUN_ID UCM_WRITE_ARTIFACTS
     mkdir -p "$session/write"
+    if [[ ${UCM_TEST_INJECT_WRITE_FAILURE:-0} == 1 ]]; then
+      printf '%s\n' '{"checked":1,"passed":0,"failed":1,"checks":{"injected_write_failure":false}}' > "$session/write/test-report.json"
+      echo "Injected write failure" >&2
+      exit 1
+    fi
     UCM_MANAGED_COLD_START=1 RUN_OUTPUT="$session/write" node "$task_dir/probe.mjs" ;;
   restart) stop_engine; prepare; start_engine readback-engine ;;
   readback)
