@@ -25,8 +25,8 @@ export function normalizeSse(text) {
 async function main() {
   const { UCM_DSH_API_KEY: key, UCM_DSH_UPSTREAM: url, UCM_DSH_MODEL: model,
     UCM_TEST_NPU: npu } = process.env;
-  if (!key || !url || !model || !npu) {
-    throw Error('Set UCM_DSH_API_KEY, UCM_DSH_UPSTREAM, UCM_DSH_MODEL and UCM_TEST_NPU');
+  if (!key || !url || !model || (!npu && !process.env.UCM_WORKFLOW_CONFIG)) {
+    throw Error('Set model API variables and either UCM_TEST_NPU or UCM_WORKFLOW_CONFIG');
   }
   const upstream = new URL(url);
   if (!['http:', 'https:'].includes(upstream.protocol) || upstream.username || upstream.password ||
@@ -106,9 +106,10 @@ async function main() {
       '',
     ].join('\n'), { mode: 0o600 });
 
-    const config = JSON.parse(readFileSync(join(here, 'managed-config.json'), 'utf8'));
+    const sourceConfig = process.env.UCM_WORKFLOW_CONFIG ? resolve(process.env.UCM_WORKFLOW_CONFIG) : join(here, 'managed-config.json');
+    const config = JSON.parse(readFileSync(sourceConfig, 'utf8'));
     for (const name of ['taskScript', 'cleanupScript', 'workflow', 'runsDir', 'taskCwd']) {
-      if (config[name]) config[name] = resolve(here, config[name]);
+      if (config[name]) config[name] = resolve(dirname(sourceConfig), config[name]);
     }
     config.dsh = {
       execution: 'process', command: [process.env.UCM_DSH_BIN ?? 'dsh', 'headless', '--patch', patch],
