@@ -120,7 +120,7 @@ async function main() {
     console.log('DSH_GATEWAY_EVIDENCE=' + evidence);
 
     const env = { ...process.env, UCM_DSH_API_KEY: proxyKey, NO_PROXY: ['127.0.0.1', process.env.NO_PROXY].filter(Boolean).join(',') };
-    const child = spawn(process.execPath, ['cli.mjs', 'run', 'dsh', 'success', '--config', configFile],
+    const child = spawn(process.execPath, ['cli.mjs', 'run', 'dsh', process.env.UCM_DSH_SCENARIO ?? 'success', '--config', configFile],
       { cwd: repo, env, stdio: 'inherit' });
     const interrupt = () => child.kill('SIGINT');
     const terminate = () => child.kill('SIGTERM');
