@@ -72,7 +72,7 @@ async function main() {
       endpoint.search = target.search;
       for (const attempt of [1, 2]) {
         const response = await fetch(endpoint, { method: 'POST', headers, body,
-          redirect: 'manual', signal: AbortSignal.timeout(60000) });
+          redirect: 'manual', signal: AbortSignal.timeout(120000) });
         const bytes = Buffer.from(await response.arrayBuffer());
         const contentType = response.headers.get('content-type') ?? 'application/octet-stream';
         const sse = contentType.toLowerCase().startsWith('text/event-stream');
@@ -87,7 +87,7 @@ async function main() {
         return;
       }
     } catch (error) {
-      log('transport_error', { id, name: error.name });
+      log('transport_error', { id, name: error.name, code: error.cause?.code ?? null });
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { message: 'Gateway transport failed' } }));
     }
@@ -103,6 +103,12 @@ async function main() {
       '        api: anthropic-messages', '        baseURL: http://127.0.0.1:' + server.address().port,
       '        apiKeyEnv: UCM_DSH_API_KEY', '        models:', '          - id: ' + quotedModel,
       '- id: agent-default-model', '  config:', '    provider: ucm-green', '    model: ' + quotedModel,
+      ...(process.env.UCM_DSH_DRIVER ? [
+        'tool-bash', 'tool-pwsh', 'tool-jobs', 'tool-fs', 'tool-fs-search',
+        'tool-working-directory', 'tool-skill', 'tool-subagent-control',
+        'tool-subagent', 'tool-subagent-fork', 'tool-workflow', 'tool-todo',
+        'tool-goal', 'tool-web',
+      ].flatMap(id => ['- id: ' + id, '  disabled: true']) : []),
       '',
     ].join('\n'), { mode: 0o600 });
 
@@ -113,7 +119,7 @@ async function main() {
     }
     config.dsh = {
       execution: 'process', command: [process.env.UCM_DSH_BIN ?? 'dsh', 'headless', '--patch', patch],
-      envNames: ['UCM_DSH_API_KEY', 'NO_PROXY', 'DSH_HOME'], timeoutMs: 180000, maxDecisions: 16,
+      envNames: ['UCM_DSH_API_KEY', 'NO_PROXY', 'DSH_HOME'], timeoutMs: 300000, maxDecisions: 16,
     };
     const configFile = join(evidence, 'workflow-config.json');
     writeFileSync(configFile, JSON.stringify(config, null, 2), { mode: 0o600 });
